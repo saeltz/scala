@@ -15,14 +15,13 @@ package scala.concurrent
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
 
-import scala.util.control.{NonFatal, NoStackTrace}
-import scala.util.{Failure, Success, Try}
-import scala.concurrent.duration._
-import scala.collection.BuildFrom
-import scala.collection.mutable.{Builder, ArrayBuffer}
-import scala.reflect.ClassTag
-
+import scala.collection.mutable.{ArrayBuffer, Builder}
+import scala.collection.{BuildFrom, mutable}
 import scala.concurrent.ExecutionContext.parasitic
+import scala.concurrent.duration._
+import scala.reflect.ClassTag
+import scala.util.control.{NoStackTrace, NonFatal}
+import scala.util.{Failure, Success, Try}
 
 /** A `Future` represents a value which may or may not *currently* be available,
  *  but will be available at some point, or an exception if that value could not be made available.
@@ -568,7 +567,7 @@ object Future {
     @throws[TimeoutException]
     @throws[InterruptedException]
     override final def ready(atMost: Duration)(implicit permit: CanAwait): this.type = {
-      import Duration.{Undefined, Inf, MinusInf}
+      import Duration.{Inf, MinusInf, Undefined}
       atMost match {
         case u if u eq Undefined => throw new IllegalArgumentException("cannot wait for Undefined period")
         case `Inf`               =>
@@ -699,10 +698,51 @@ object Future {
    * @param in        the `IterableOnce` of Futures which will be sequenced
    * @return          the `Future` of the resulting collection
    */
-  final def sequence[A, CC[X] <: IterableOnce[X], To](in: CC[Future[A]])(implicit bf: BuildFrom[CC[Future[A]], A, To], executor: ExecutionContext): Future[To] =
+  final def sequenceOld[A, CC[X] <: IterableOnce[X], To](in: CC[Future[A]])(implicit bf: BuildFrom[CC[Future[A]], A, To], executor: ExecutionContext): Future[To] =
     in.iterator.foldLeft(successful(bf.newBuilder(in))) {
       (fr, fa) => fr.zipWith(fa)(Future.addToBuilderFun)
     }.map(_.result())(if (executor.isInstanceOf[BatchingExecutor]) executor else parasitic)
+
+  /** Simple version of `Future.traverse`. Asynchronously and non-blockingly transforms, in essence, a `IterableOnce[Future[A]]`
+   *  into a `Future[IterableOnce[A]]`. Useful for reducing many `Future`s into a single `Future`.
+   *
+   * @tparam A        the type of the value inside the Futures
+   * @tparam CC       the type of the `IterableOnce` of Futures
+   * @tparam To       the type of the resulting collection
+   * @param in        the `IterableOnce` of Futures which will be sequenced
+   * @return          the `Future` of the resulting collection
+   */
+  final def sequence[A, CC[X] <: IterableOnce[X], To](in: CC[Future[A]])(implicit bf: BuildFrom[CC[Future[A]], A, To], executor: ExecutionContext): Future[To] = {
+    val sequencer: Try[A] => Boolean = {
+      case Success(_) => true
+      case Failure(t) => throw t
+    }
+
+    sequenceSelectively(in, sequencer)
+  }
+
+  /** Asynchronously and non-blockingly transforms, in essence, an `IterableOnce[Future[A]]` into a `Future[IterableOnce[A]]`
+   *  for all `Future`s where the given `predicate` matches. Useful for reducing many `Future`s into a single `Future`.
+   *  If the predicate matches on a `Failure`, it returns the first `Failure` in the collection.
+   *
+   * @tparam A        the type of the value inside the Futures
+   * @tparam CC       the type of the `IterableOnce` of Futures
+   * @tparam To       the type of the resulting collection
+   * @param in        the `IterableOnce` of Futures which will be sequenced
+   * @param predicate the filter function
+   * @return          the `Future` of the resulting collection
+   */
+  final def sequenceSelectively[A, CC[X] <: IterableOnce[X], To](in: CC[Future[A]], predicate: Try[A] => Boolean)(implicit bf: BuildFrom[CC[Future[A]], A, To], executor: ExecutionContext): Future[To] = {
+    def iter(i: Iterator[Future[A]], builder: mutable.Builder[A, To]): Future[To] =
+      if (!i.hasNext) successful(builder.result())
+      else i.next().transformWith {
+        case tr@Success(a) if predicate(tr) => iter(i, builder += a)
+        case tr@Failure(exception) if predicate(tr) => successful(throw exception)
+        case _ => iter(i, builder)
+      }
+
+    iter(in.iterator, bf.newBuilder(in))
+  }
 
   /** Asynchronously and non-blockingly returns a new `Future` to the result of the first future
    *  in the list that is completed. This means no matter if it is completed as a success or as a failure.
